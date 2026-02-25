@@ -1,5 +1,3 @@
 node_modules
-src
-*.ts
-tsconfig.json
+dist
 .git
