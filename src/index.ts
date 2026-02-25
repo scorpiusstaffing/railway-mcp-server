@@ -1,118 +1,782 @@
-#!/usr/bin/env node
-/**
- * Railway MCP Server - Full Railway API integration via MCP protocol.
- * Uses Railway's GraphQL API for projects, services, deployments, variables, volumes, domains, and more.
- */
-
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import express from "express";
 import { z } from "zod";
-import axios, { AxiosError } from "axios";
 
-const RAILWAY_API = "https://backboard.railway.com/graphql/v2";
-const CHARACTER_LIMIT = 25000;
-const RAILWAY_TOKEN = process.env.RAILWAY_TOKEN || "";
+// ── Railway GraphQL Client ──────────────────────────────────────────────────
 
-async function gql<T = unknown>(query: string, variables?: Record<string, unknown>): Promise<T> {
-  const resp = await axios.post(RAILWAY_API, { query, variables }, {
-    timeout: 30000, headers: { Authorization: `Bearer ${RAILWAY_TOKEN}`, "Content-Type": "application/json" },
+const RAILWAY_API = "https://backboard.railway.app/graphql/v2";
+
+async function gql(query: string, variables: Record<string, unknown> = {}): Promise<any> {
+  const token = process.env.RAILWAY_API_TOKEN;
+  if (!token) throw new Error("RAILWAY_API_TOKEN environment variable is required");
+
+  const res = await fetch(RAILWAY_API, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ query, variables }),
   });
-  if (resp.data.errors?.length) throw new Error(resp.data.errors.map((e: { message: string }) => e.message).join("; "));
-  return resp.data.data as T;
-}
 
-function handleError(error: unknown): string {
-  if (error instanceof AxiosError) {
-    const status = error.response?.status;
-    const msg = error.response?.data?.errors?.[0]?.message || error.response?.data?.message || error.message;
-    if (status === 401) return `Error 401: Unauthorized. Check RAILWAY_TOKEN. (${msg})`;
-    if (status === 403) return `Error 403: Forbidden. (${msg})`;
-    return `Error ${status}: ${msg}`;
+  const json = await res.json();
+  if (json.errors?.length) {
+    throw new Error(json.errors.map((e: any) => e.message).join("; "));
   }
-  return `Error: ${error instanceof Error ? error.message : String(error)}`;
+  return json.data;
 }
 
-function ok(text: string) { return { content: [{ type: "text" as const, text }] }; }
-function err(error: unknown) { return { content: [{ type: "text" as const, text: handleError(error) }], isError: true }; }
-function truncate(text: string): string { if (text.length <= CHARACTER_LIMIT) return text; return text.slice(0, CHARACTER_LIMIT) + "\n\n... [truncated]"; }
-function json(data: unknown): string { return truncate(JSON.stringify(data, null, 2)); }
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
-const server = new McpServer({ name: "railway-mcp-server", version: "1.0.0" });
-
-server.registerTool("railway_me", { title: "Get Railway Account", description: "Get the authenticated Railway user's account details.", inputSchema: {}, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } }, async () => { try { return ok(json(await gql(`query { me { id name email avatar } }`))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_list_projects", { title: "List Projects", description: "List all Railway projects for the authenticated user or a team.", inputSchema: { teamId: z.string().optional().describe("Team ID to filter projects (omit for personal projects)") }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } }, async (params) => { try { const q = params.teamId ? `query($teamId: String!) { team(id: $teamId) { projects { edges { node { id name description createdAt updatedAt environments { edges { node { id name } } } services { edges { node { id name } } } } } } } }` : `query { me { projects { edges { node { id name description createdAt updatedAt environments { edges { node { id name } } } services { edges { node { id name } } } } } } } }`; return ok(json(await gql(q, params.teamId ? { teamId: params.teamId } : undefined))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_get_project", { title: "Get Project Details", description: "Get full details of a Railway project including services, environments, and plugins.", inputSchema: { projectId: z.string().describe("Project ID") }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } }, async (params) => { try { return ok(json(await gql(`query($id: String!) { project(id: $id) { id name description createdAt updatedAt team { id name } environments { edges { node { id name } } } services { edges { node { id name icon createdAt updatedAt } } } plugins { edges { node { id name } } } volumes { edges { node { id name mountPath } } } } }`, { id: params.projectId }))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_create_project", { title: "Create Project", description: "Create a new Railway project.", inputSchema: { name: z.string().describe("Project name"), description: z.string().optional(), teamId: z.string().optional().describe("Team ID (omit for personal project)") }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } }, async (params) => { try { return ok(json(await gql(`mutation($input: ProjectCreateInput!) { projectCreate(input: $input) { id name description } }`, { input: { name: params.name, description: params.description, teamId: params.teamId } }))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_delete_project", { title: "Delete Project", description: "Permanently delete a Railway project. THIS IS IRREVERSIBLE.", inputSchema: { projectId: z.string() }, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true } }, async (params) => { try { await gql(`mutation($id: String!) { projectDelete(id: $id) }`, { id: params.projectId }); return ok(`Project ${params.projectId} deleted.`); } catch (e) { return err(e); } });
-
-server.registerTool("railway_update_project", { title: "Update Project", description: "Update project name or description.", inputSchema: { projectId: z.string(), name: z.string().optional(), description: z.string().optional() }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } }, async (params) => { try { const input: Record<string, unknown> = {}; if (params.name) input.name = params.name; if (params.description !== undefined) input.description = params.description; return ok(json(await gql(`mutation($id: String!, $input: ProjectUpdateInput!) { projectUpdate(id: $id, input: $input) { id name description } }`, { id: params.projectId, input }))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_list_services", { title: "List Services", description: "List services in a Railway project.", inputSchema: { projectId: z.string() }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } }, async (params) => { try { return ok(json(await gql(`query($projectId: String!) { project(id: $projectId) { services { edges { node { id name icon createdAt updatedAt } } } } }`, { projectId: params.projectId }))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_get_service", { title: "Get Service Details", description: "Get details of a Railway service including deployments and instances.", inputSchema: { serviceId: z.string() }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } }, async (params) => { try { return ok(json(await gql(`query($id: String!) { service(id: $id) { id name icon createdAt updatedAt project { id name } serviceInstances { edges { node { id environmentId startCommand buildCommand healthcheckPath numReplicas source { repo image } domains { serviceDomains { domain } customDomains { domain } } } } } } }`, { id: params.serviceId }))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_create_service", { title: "Create Service", description: "Create a new service in a project. Can be from a GitHub repo or Docker image.", inputSchema: { projectId: z.string(), name: z.string().optional().describe("Service name"), source: z.object({ repo: z.string().optional().describe("GitHub repo (e.g. 'owner/repo')"), image: z.string().optional().describe("Docker image (e.g. 'redis:latest')") }).optional().describe("Service source — either repo or image") }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } }, async (params) => { try { const input: Record<string, unknown> = { projectId: params.projectId }; if (params.name) input.name = params.name; if (params.source) input.source = params.source; return ok(json(await gql(`mutation($input: ServiceCreateInput!) { serviceCreate(input: $input) { id name } }`, { input }))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_delete_service", { title: "Delete Service", description: "Delete a service from a project.", inputSchema: { serviceId: z.string() }, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true } }, async (params) => { try { await gql(`mutation($id: String!) { serviceDelete(id: $id) }`, { id: params.serviceId }); return ok(`Service ${params.serviceId} deleted.`); } catch (e) { return err(e); } });
-
-server.registerTool("railway_update_service", { title: "Update Service", description: "Update service name or icon.", inputSchema: { serviceId: z.string(), name: z.string().optional(), icon: z.string().optional() }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } }, async (params) => { try { const input: Record<string, unknown> = {}; if (params.name) input.name = params.name; if (params.icon) input.icon = params.icon; return ok(json(await gql(`mutation($id: String!, $input: ServiceUpdateInput!) { serviceUpdate(id: $id, input: $input) { id name } }`, { id: params.serviceId, input }))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_update_service_instance", { title: "Update Service Instance", description: "Update service instance config — start command, build command, healthcheck, replicas, etc.", inputSchema: { serviceId: z.string(), environmentId: z.string(), startCommand: z.string().optional(), buildCommand: z.string().optional(), healthcheckPath: z.string().optional(), numReplicas: z.number().int().optional(), sleepApplication: z.boolean().optional(), rootDirectory: z.string().optional() }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } }, async (params) => { try { const { serviceId, environmentId, ...input } = params; return ok(json(await gql(`mutation($serviceId: String!, $environmentId: String!, $input: ServiceInstanceUpdateInput!) { serviceInstanceUpdate(serviceId: $serviceId, environmentId: $environmentId, input: $input) { id } }`, { serviceId, environmentId, input }))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_list_deployments", { title: "List Deployments", description: "List deployments for a service in a specific environment.", inputSchema: { serviceId: z.string(), environmentId: z.string(), first: z.number().int().min(1).max(50).default(10) }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } }, async (params) => { try { return ok(json(await gql(`query($input: DeploymentListInput!, $first: Int) { deployments(input: $input, first: $first) { edges { node { id status createdAt updatedAt staticUrl meta { ... on DeploymentMetaGithub { commitHash commitMessage branch repo } } } } } }`, { input: { serviceId: params.serviceId, environmentId: params.environmentId }, first: params.first }))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_get_deployment", { title: "Get Deployment Details", description: "Get full details of a specific deployment.", inputSchema: { deploymentId: z.string() }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } }, async (params) => { try { return ok(json(await gql(`query($id: String!) { deployment(id: $id) { id status createdAt updatedAt staticUrl service { id name } environment { id name } meta { ... on DeploymentMetaGithub { commitHash commitMessage branch repo } } } }`, { id: params.deploymentId }))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_redeploy", { title: "Redeploy Service", description: "Trigger a redeployment of the latest deployment for a service in an environment.", inputSchema: { serviceId: z.string(), environmentId: z.string() }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } }, async (params) => { try { return ok(json(await gql(`mutation($serviceId: String!, $environmentId: String!) { serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId) }`, { serviceId: params.serviceId, environmentId: params.environmentId }))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_remove_deployment", { title: "Remove Deployment", description: "Remove/cancel a specific deployment.", inputSchema: { deploymentId: z.string() }, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true } }, async (params) => { try { await gql(`mutation($id: String!) { deploymentRemove(id: $id) }`, { id: params.deploymentId }); return ok(`Deployment ${params.deploymentId} removed.`); } catch (e) { return err(e); } });
-
-server.registerTool("railway_restart_deployment", { title: "Restart Deployment", description: "Restart the active deployment for a service.", inputSchema: { deploymentId: z.string() }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } }, async (params) => { try { await gql(`mutation($id: String!) { deploymentRestart(id: $id) }`, { id: params.deploymentId }); return ok(`Deployment ${params.deploymentId} restarted.`); } catch (e) { return err(e); } });
-
-server.registerTool("railway_get_deployment_logs", { title: "Get Deployment Logs", description: "Get build and deploy logs for a deployment.", inputSchema: { deploymentId: z.string(), limit: z.number().int().min(1).max(500).default(100) }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } }, async (params) => { try { return ok(json(await gql(`query($deploymentId: String!, $limit: Int) { deploymentLogs(deploymentId: $deploymentId, limit: $limit) { ... on Log { message timestamp severity } } }`, { deploymentId: params.deploymentId, limit: params.limit }))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_list_variables", { title: "List Variables", description: "List environment variables for a service in an environment.", inputSchema: { projectId: z.string(), serviceId: z.string(), environmentId: z.string() }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } }, async (params) => { try { return ok(json(await gql(`query($projectId: String!, $serviceId: String!, $environmentId: String!) { variables(projectId: $projectId, serviceId: $serviceId, environmentId: $environmentId) }`, params))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_upsert_variable", { title: "Set Variable", description: "Create or update an environment variable for a service.", inputSchema: { projectId: z.string(), serviceId: z.string(), environmentId: z.string(), name: z.string().describe("Variable name"), value: z.string().describe("Variable value") }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } }, async (params) => { try { const data = await gql(`mutation($input: VariableCollectionUpsertInput!) { variableCollectionUpsert(input: $input) }`, { input: { projectId: params.projectId, serviceId: params.serviceId, environmentId: params.environmentId, variables: { [params.name]: params.value } } }); return ok(`Variable '${params.name}' set. ${json(data)}`); } catch (e) { return err(e); } });
-
-server.registerTool("railway_upsert_variables_bulk", { title: "Set Multiple Variables", description: "Create or update multiple environment variables at once.", inputSchema: { projectId: z.string(), serviceId: z.string(), environmentId: z.string(), variables: z.record(z.string()).describe("Map of variable name to value") }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } }, async (params) => { try { const data = await gql(`mutation($input: VariableCollectionUpsertInput!) { variableCollectionUpsert(input: $input) }`, { input: { projectId: params.projectId, serviceId: params.serviceId, environmentId: params.environmentId, variables: params.variables } }); return ok(`Variables set. ${json(data)}`); } catch (e) { return err(e); } });
-
-server.registerTool("railway_delete_variable", { title: "Delete Variable", description: "Delete an environment variable from a service.", inputSchema: { projectId: z.string(), serviceId: z.string(), environmentId: z.string(), name: z.string().describe("Variable name to delete") }, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true } }, async (params) => { try { const data = await gql(`mutation($input: VariableDeleteInput!) { variableDelete(input: $input) }`, { input: { projectId: params.projectId, serviceId: params.serviceId, environmentId: params.environmentId, name: params.name } }); return ok(`Variable '${params.name}' deleted. ${json(data)}`); } catch (e) { return err(e); } });
-
-server.registerTool("railway_list_environments", { title: "List Environments", description: "List environments for a project.", inputSchema: { projectId: z.string() }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } }, async (params) => { try { return ok(json(await gql(`query($id: String!) { project(id: $id) { environments { edges { node { id name createdAt updatedAt } } } } }`, { id: params.projectId }))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_create_environment", { title: "Create Environment", description: "Create a new environment in a project (e.g. staging, production).", inputSchema: { projectId: z.string(), name: z.string() }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } }, async (params) => { try { return ok(json(await gql(`mutation($input: EnvironmentCreateInput!) { environmentCreate(input: $input) { id name } }`, { input: { projectId: params.projectId, name: params.name } }))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_delete_environment", { title: "Delete Environment", description: "Delete an environment from a project.", inputSchema: { environmentId: z.string() }, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true } }, async (params) => { try { await gql(`mutation($id: String!) { environmentDelete(id: $id) }`, { id: params.environmentId }); return ok(`Environment ${params.environmentId} deleted.`); } catch (e) { return err(e); } });
-
-server.registerTool("railway_create_service_domain", { title: "Create Service Domain", description: "Generate a *.railway.app domain for a service.", inputSchema: { serviceId: z.string(), environmentId: z.string() }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } }, async (params) => { try { return ok(json(await gql(`mutation($serviceId: String!, $environmentId: String!) { serviceDomainCreate(serviceId: $serviceId, environmentId: $environmentId) { id domain } }`, params))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_create_custom_domain", { title: "Create Custom Domain", description: "Add a custom domain to a service.", inputSchema: { serviceId: z.string(), environmentId: z.string(), domain: z.string().describe("Custom domain (e.g. 'app.example.com')") }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } }, async (params) => { try { return ok(json(await gql(`mutation($serviceId: String!, $environmentId: String!, $domain: String!) { customDomainCreate(serviceId: $serviceId, environmentId: $environmentId, domain: $domain) { id domain } }`, params))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_list_volumes", { title: "List Volumes", description: "List volumes attached to a project.", inputSchema: { projectId: z.string() }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } }, async (params) => { try { return ok(json(await gql(`query($id: String!) { project(id: $id) { volumes { edges { node { id name mountPath createdAt } } } } }`, { id: params.projectId }))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_create_volume", { title: "Create Volume", description: "Create a persistent volume for a service.", inputSchema: { projectId: z.string(), serviceId: z.string(), environmentId: z.string(), mountPath: z.string().describe("Mount path in the container (e.g. '/data')") }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } }, async (params) => { try { return ok(json(await gql(`mutation($input: VolumeCreateInput!) { volumeCreate(input: $input) { id name mountPath } }`, { input: params }))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_create_tcp_proxy", { title: "Create TCP Proxy", description: "Create a TCP proxy for a service (useful for databases).", inputSchema: { serviceId: z.string(), environmentId: z.string(), applicationPort: z.number().int().describe("Internal application port") }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } }, async (params) => { try { return ok(json(await gql(`mutation($input: TCPProxyCreateInput!) { tcpProxyCreate(input: $input) { id domain proxyPort applicationPort } }`, { input: params }))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_deploy_template", { title: "Deploy Template", description: "Deploy a project from a Railway template code.", inputSchema: { templateCode: z.string().describe("Template code from Railway templates"), teamId: z.string().optional() }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } }, async (params) => { try { const input: Record<string, unknown> = { templateCode: params.templateCode }; if (params.teamId) input.teamId = params.teamId; return ok(json(await gql(`mutation($input: TemplateDeployInput!) { templateDeploy(input: $input) { projectId workflowId } }`, { input }))); } catch (e) { return err(e); } });
-
-server.registerTool("railway_graphql", { title: "Raw Railway GraphQL Query", description: "Execute an arbitrary GraphQL query/mutation against the Railway API. Use this for any operation not covered by other tools. See Railway API docs.", inputSchema: { query: z.string().describe("GraphQL query or mutation"), variables: z.record(z.unknown()).optional().describe("GraphQL variables") }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } }, async (params) => { try { return ok(json(await gql(params.query, params.variables as Record<string, unknown> | undefined))); } catch (e) { return err(e); } });
-
-async function runStdio() { const transport = new StdioServerTransport(); await server.connect(transport); console.error("Railway MCP server running via stdio"); }
-async function runHTTP() {
-  const app = express(); app.use(express.json());
-  app.post("/mcp", async (req, res) => { const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true }); res.on("close", () => transport.close()); await server.connect(transport); await transport.handleRequest(req, res, req.body); });
-  app.get("/health", (_req, res) => res.json({ status: "ok", server: "railway-mcp-server" }));
-  const port = parseInt(process.env.PORT || "3000"); app.listen(port, () => console.error(`Railway MCP server running on http://0.0.0.0:${port}/mcp`));
+function edgesToList(connection: any): any[] {
+  if (!connection?.edges) return [];
+  return connection.edges.map((e: any) => e.node);
 }
-if (!RAILWAY_TOKEN) { console.error("WARNING: RAILWAY_TOKEN not set. API calls will fail."); }
-const transport = process.env.TRANSPORT || (process.env.PORT ? "http" : "stdio");
-if (transport === "http") { runHTTP().catch((e) => { console.error("Fatal:", e); process.exit(1); }); }
-else { runStdio().catch((e) => { console.error("Fatal:", e); process.exit(1); }); }
+
+function fmt(data: unknown): string {
+  return JSON.stringify(data, null, 2);
+}
+
+// ── MCP Server ──────────────────────────────────────────────────────────────
+
+const server = new McpServer({
+  name: "railway-mcp-server",
+  version: "1.0.0",
+});
+
+// ── Tool: railway_me ────────────────────────────────────────────────────────
+
+server.tool(
+  "railway_me",
+  "Get the authenticated Railway user profile including workspaces",
+  {},
+  async () => {
+    const data = await gql(`
+      query {
+        me {
+          id name email username
+          workspaces {
+            id name
+            projects(first: 100) {
+              edges { node { id name } }
+            }
+          }
+        }
+      }
+    `);
+    const user = data.me;
+    const result = {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      username: user.username,
+      workspaces: user.workspaces.map((ws: any) => ({
+        id: ws.id,
+        name: ws.name,
+        projects: edgesToList(ws.projects),
+      })),
+    };
+    return { content: [{ type: "text", text: fmt(result) }] };
+  }
+);
+
+// ── Tool: railway_list_projects ─────────────────────────────────────────────
+
+server.tool(
+  "railway_list_projects",
+  "List all projects in a workspace. If no workspaceId given, lists projects across all workspaces.",
+  { workspaceId: z.string().optional().describe("Filter by workspace ID") },
+  async ({ workspaceId }) => {
+    const data = await gql(`
+      query {
+        me {
+          workspaces {
+            id name
+            projects(first: 100) {
+              edges {
+                node {
+                  id name description createdAt updatedAt
+                  services(first: 50) { edges { node { id name } } }
+                  environments(first: 50) { edges { node { id name } } }
+                }
+              }
+            }
+          }
+        }
+      }
+    `);
+
+    let projects: any[] = [];
+    for (const ws of data.me.workspaces) {
+      if (workspaceId && ws.id !== workspaceId) continue;
+      for (const p of edgesToList(ws.projects)) {
+        projects.push({
+          ...p,
+          workspaceId: ws.id,
+          workspaceName: ws.name,
+          services: edgesToList(p.services),
+          environments: edgesToList(p.environments),
+        });
+      }
+    }
+    return { content: [{ type: "text", text: fmt(projects) }] };
+  }
+);
+
+// ── Tool: railway_get_project ───────────────────────────────────────────────
+
+server.tool(
+  "railway_get_project",
+  "Get full details of a Railway project by ID, including services, environments, and volumes",
+  { projectId: z.string().describe("Project ID") },
+  async ({ projectId }) => {
+    const data = await gql(`
+      query($projectId: String!) {
+        project(id: $projectId) {
+          id name description createdAt updatedAt isPublic subscriptionType
+          services(first: 100) {
+            edges { node { id name icon createdAt updatedAt projectId } }
+          }
+          environments(first: 100) {
+            edges { node { id name createdAt updatedAt isEphemeral } }
+          }
+          volumes(first: 100) {
+            edges { node { id name createdAt } }
+          }
+        }
+      }
+    `, { projectId });
+
+    const p = data.project;
+    const result = {
+      ...p,
+      services: edgesToList(p.services),
+      environments: edgesToList(p.environments),
+      volumes: edgesToList(p.volumes),
+    };
+    return { content: [{ type: "text", text: fmt(result) }] };
+  }
+);
+
+// ── Tool: railway_get_service ───────────────────────────────────────────────
+
+server.tool(
+  "railway_get_service",
+  "Get details of a Railway service including recent deployments",
+  { serviceId: z.string().describe("Service ID") },
+  async ({ serviceId }) => {
+    const data = await gql(`
+      query($serviceId: String!) {
+        service(id: $serviceId) {
+          id name icon createdAt updatedAt projectId templateId
+          deployments(first: 10) {
+            edges {
+              node {
+                id status createdAt updatedAt url staticUrl
+                environmentId serviceId
+              }
+            }
+          }
+        }
+      }
+    `, { serviceId });
+
+    const s = data.service;
+    return {
+      content: [{
+        type: "text",
+        text: fmt({ ...s, deployments: edgesToList(s.deployments) }),
+      }],
+    };
+  }
+);
+
+// ── Tool: railway_list_services ─────────────────────────────────────────────
+
+server.tool(
+  "railway_list_services",
+  "List services in a Railway project",
+  { projectId: z.string().describe("Project ID") },
+  async ({ projectId }) => {
+    const data = await gql(`
+      query($projectId: String!) {
+        project(id: $projectId) {
+          services(first: 100) {
+            edges {
+              node { id name icon createdAt updatedAt projectId }
+            }
+          }
+        }
+      }
+    `, { projectId });
+    return { content: [{ type: "text", text: fmt(edgesToList(data.project.services)) }] };
+  }
+);
+
+// ── Tool: railway_list_environments ─────────────────────────────────────────
+
+server.tool(
+  "railway_list_environments",
+  "List environments in a Railway project",
+  { projectId: z.string().describe("Project ID") },
+  async ({ projectId }) => {
+    const data = await gql(`
+      query($projectId: String!) {
+        project(id: $projectId) {
+          environments(first: 100) {
+            edges {
+              node { id name createdAt updatedAt isEphemeral }
+            }
+          }
+        }
+      }
+    `, { projectId });
+    return { content: [{ type: "text", text: fmt(edgesToList(data.project.environments)) }] };
+  }
+);
+
+// ── Tool: railway_list_deployments ──────────────────────────────────────────
+
+server.tool(
+  "railway_list_deployments",
+  "List deployments for a service in an environment",
+  {
+    serviceId: z.string().describe("Service ID"),
+    environmentId: z.string().describe("Environment ID"),
+    first: z.number().optional().default(10).describe("Number of deployments to return (default 10, max 50)"),
+  },
+  async ({ serviceId, environmentId, first }) => {
+    const data = await gql(`
+      query($input: DeploymentListInput!, $first: Int) {
+        deployments(input: $input, first: $first) {
+          edges {
+            node {
+              id status createdAt updatedAt url staticUrl
+              environmentId serviceId
+              meta
+            }
+          }
+        }
+      }
+    `, { input: { serviceId, environmentId }, first: Math.min(first, 50) });
+    return { content: [{ type: "text", text: fmt(edgesToList(data.deployments)) }] };
+  }
+);
+
+// ── Tool: railway_get_deployment ────────────────────────────────────────────
+
+server.tool(
+  "railway_get_deployment",
+  "Get full details of a specific deployment",
+  { deploymentId: z.string().describe("Deployment ID") },
+  async ({ deploymentId }) => {
+    const data = await gql(`
+      query($id: String!) {
+        deployment(id: $id) {
+          id status createdAt updatedAt url staticUrl
+          environmentId serviceId projectId
+          meta canRedeploy canRollback
+        }
+      }
+    `, { id: deploymentId });
+    return { content: [{ type: "text", text: fmt(data.deployment) }] };
+  }
+);
+
+// ── Tool: railway_get_deploy_logs ───────────────────────────────────────────
+
+server.tool(
+  "railway_get_deploy_logs",
+  "Get deploy logs for a deployment",
+  {
+    deploymentId: z.string().describe("Deployment ID"),
+    limit: z.number().optional().default(100).describe("Max log lines (default 100, max 500)"),
+  },
+  async ({ deploymentId, limit }) => {
+    const data = await gql(`
+      query($deploymentId: String!, $limit: Int) {
+        deploymentLogs(deploymentId: $deploymentId, limit: $limit) {
+          ... on Log { message severity timestamp }
+        }
+      }
+    `, { deploymentId, limit: Math.min(limit, 500) });
+    return { content: [{ type: "text", text: fmt(data.deploymentLogs) }] };
+  }
+);
+
+// ── Tool: railway_get_build_logs ────────────────────────────────────────────
+
+server.tool(
+  "railway_get_build_logs",
+  "Get build logs for a deployment",
+  {
+    deploymentId: z.string().describe("Deployment ID"),
+    limit: z.number().optional().default(100).describe("Max log lines (default 100, max 500)"),
+  },
+  async ({ deploymentId, limit }) => {
+    const data = await gql(`
+      query($deploymentId: String!, $limit: Int) {
+        buildLogs(deploymentId: $deploymentId, limit: $limit) {
+          ... on Log { message severity timestamp }
+        }
+      }
+    `, { deploymentId, limit: Math.min(limit, 500) });
+    return { content: [{ type: "text", text: fmt(data.buildLogs) }] };
+  }
+);
+
+// ── Tool: railway_list_variables ────────────────────────────────────────────
+
+server.tool(
+  "railway_list_variables",
+  "List environment variables for a service in an environment",
+  {
+    projectId: z.string().describe("Project ID"),
+    serviceId: z.string().describe("Service ID"),
+    environmentId: z.string().describe("Environment ID"),
+  },
+  async ({ projectId, serviceId, environmentId }) => {
+    const data = await gql(`
+      query($projectId: String!, $serviceId: String!, $environmentId: String!) {
+        variables(projectId: $projectId, serviceId: $serviceId, environmentId: $environmentId)
+      }
+    `, { projectId, serviceId, environmentId });
+    return { content: [{ type: "text", text: fmt(data.variables) }] };
+  }
+);
+
+// ── Tool: railway_upsert_variable ───────────────────────────────────────────
+
+server.tool(
+  "railway_upsert_variable",
+  "Create or update an environment variable for a service",
+  {
+    projectId: z.string().describe("Project ID"),
+    environmentId: z.string().describe("Environment ID"),
+    name: z.string().describe("Variable name"),
+    value: z.string().describe("Variable value"),
+    serviceId: z.string().optional().describe("Service ID (optional, for service-specific vars)"),
+  },
+  async ({ projectId, environmentId, name, value, serviceId }) => {
+    const input: Record<string, unknown> = { projectId, environmentId, name, value };
+    if (serviceId) input.serviceId = serviceId;
+    const data = await gql(`
+      mutation($input: VariableUpsertInput!) {
+        variableUpsert(input: $input)
+      }
+    `, { input });
+    return { content: [{ type: "text", text: `Variable "${name}" upserted successfully.` }] };
+  }
+);
+
+// ── Tool: railway_delete_variable ───────────────────────────────────────────
+
+server.tool(
+  "railway_delete_variable",
+  "Delete an environment variable",
+  {
+    projectId: z.string().describe("Project ID"),
+    environmentId: z.string().describe("Environment ID"),
+    name: z.string().describe("Variable name to delete"),
+    serviceId: z.string().optional().describe("Service ID (optional)"),
+  },
+  async ({ projectId, environmentId, name, serviceId }) => {
+    const input: Record<string, unknown> = { projectId, environmentId, name };
+    if (serviceId) input.serviceId = serviceId;
+    const data = await gql(`
+      mutation($input: VariableDeleteInput!) {
+        variableDelete(input: $input)
+      }
+    `, { input });
+    return { content: [{ type: "text", text: `Variable "${name}" deleted successfully.` }] };
+  }
+);
+
+// ── Tool: railway_redeploy ──────────────────────────────────────────────────
+
+server.tool(
+  "railway_redeploy",
+  "Trigger a redeployment of a deployment",
+  { deploymentId: z.string().describe("Deployment ID to redeploy") },
+  async ({ deploymentId }) => {
+    const data = await gql(`
+      mutation($id: String!) {
+        deploymentRedeploy(id: $id)
+      }
+    `, { id: deploymentId });
+    return { content: [{ type: "text", text: `Redeployment triggered. New deployment: ${fmt(data.deploymentRedeploy)}` }] };
+  }
+);
+
+// ── Tool: railway_restart_deployment ────────────────────────────────────────
+
+server.tool(
+  "railway_restart_deployment",
+  "Restart a deployment",
+  { deploymentId: z.string().describe("Deployment ID to restart") },
+  async ({ deploymentId }) => {
+    const data = await gql(`
+      mutation($id: String!) {
+        deploymentRestart(id: $id)
+      }
+    `, { id: deploymentId });
+    return { content: [{ type: "text", text: "Deployment restarted successfully." }] };
+  }
+);
+
+// ── Tool: railway_cancel_deployment ─────────────────────────────────────────
+
+server.tool(
+  "railway_cancel_deployment",
+  "Cancel a running deployment",
+  { deploymentId: z.string().describe("Deployment ID to cancel") },
+  async ({ deploymentId }) => {
+    await gql(`mutation($id: String!) { deploymentCancel(id: $id) }`, { id: deploymentId });
+    return { content: [{ type: "text", text: "Deployment cancelled." }] };
+  }
+);
+
+// ── Tool: railway_remove_deployment ─────────────────────────────────────────
+
+server.tool(
+  "railway_remove_deployment",
+  "Remove/delete a deployment",
+  { deploymentId: z.string().describe("Deployment ID to remove") },
+  async ({ deploymentId }) => {
+    await gql(`mutation($id: String!) { deploymentRemove(id: $id) }`, { id: deploymentId });
+    return { content: [{ type: "text", text: "Deployment removed." }] };
+  }
+);
+
+// ── Tool: railway_create_project ────────────────────────────────────────────
+
+server.tool(
+  "railway_create_project",
+  "Create a new Railway project",
+  {
+    name: z.string().describe("Project name"),
+    description: z.string().optional().describe("Project description"),
+    workspaceId: z.string().optional().describe("Workspace ID (uses default if not specified)"),
+  },
+  async ({ name, description, workspaceId }) => {
+    const input: Record<string, unknown> = { name };
+    if (description) input.description = description;
+    if (workspaceId) input.teamId = workspaceId; // Railway API uses teamId in the input
+    const data = await gql(`
+      mutation($input: ProjectCreateInput!) {
+        projectCreate(input: $input) { id name }
+      }
+    `, { input });
+    return { content: [{ type: "text", text: fmt(data.projectCreate) }] };
+  }
+);
+
+// ── Tool: railway_delete_project ────────────────────────────────────────────
+
+server.tool(
+  "railway_delete_project",
+  "Permanently delete a Railway project (IRREVERSIBLE)",
+  { projectId: z.string().describe("Project ID to delete") },
+  async ({ projectId }) => {
+    await gql(`mutation($id: String!) { projectDelete(id: $id) }`, { id: projectId });
+    return { content: [{ type: "text", text: "Project deleted." }] };
+  }
+);
+
+// ── Tool: railway_update_project ────────────────────────────────────────────
+
+server.tool(
+  "railway_update_project",
+  "Update a project's name or description",
+  {
+    projectId: z.string().describe("Project ID"),
+    name: z.string().optional().describe("New name"),
+    description: z.string().optional().describe("New description"),
+  },
+  async ({ projectId, name, description }) => {
+    const input: Record<string, unknown> = {};
+    if (name) input.name = name;
+    if (description) input.description = description;
+    const data = await gql(`
+      mutation($id: String!, $input: ProjectUpdateInput!) {
+        projectUpdate(id: $id, input: $input) { id name description }
+      }
+    `, { id: projectId, input });
+    return { content: [{ type: "text", text: fmt(data.projectUpdate) }] };
+  }
+);
+
+// ── Tool: railway_create_service ────────────────────────────────────────────
+
+server.tool(
+  "railway_create_service",
+  "Create a new service in a project. Optionally from a GitHub repo or Docker image.",
+  {
+    projectId: z.string().describe("Project ID"),
+    name: z.string().optional().describe("Service name"),
+    source: z.object({
+      repo: z.string().optional().describe("GitHub repo (owner/repo)"),
+      image: z.string().optional().describe("Docker image (e.g., redis:latest)"),
+    }).optional().describe("Service source"),
+  },
+  async ({ projectId, name, source }) => {
+    const input: Record<string, unknown> = { projectId };
+    if (name) input.name = name;
+    if (source) input.source = source;
+    const data = await gql(`
+      mutation($input: ServiceCreateInput!) {
+        serviceCreate(input: $input) { id name projectId }
+      }
+    `, { input });
+    return { content: [{ type: "text", text: fmt(data.serviceCreate) }] };
+  }
+);
+
+// ── Tool: railway_delete_service ────────────────────────────────────────────
+
+server.tool(
+  "railway_delete_service",
+  "Delete a service from a project",
+  { serviceId: z.string().describe("Service ID to delete") },
+  async ({ serviceId }) => {
+    await gql(`mutation($id: String!) { serviceDelete(id: $id) }`, { id: serviceId });
+    return { content: [{ type: "text", text: "Service deleted." }] };
+  }
+);
+
+// ── Tool: railway_update_service_instance ────────────────────────────────────
+
+server.tool(
+  "railway_update_service_instance",
+  "Update service instance configuration: start/build commands, healthcheck, replicas, region, sleep, etc.",
+  {
+    serviceId: z.string().describe("Service ID"),
+    environmentId: z.string().describe("Environment ID"),
+    startCommand: z.string().optional().describe("Start command"),
+    buildCommand: z.string().optional().describe("Build command"),
+    rootDirectory: z.string().optional().describe("Root directory"),
+    healthcheckPath: z.string().optional().describe("Healthcheck endpoint path"),
+    healthcheckTimeout: z.number().optional().describe("Healthcheck timeout in seconds"),
+    numReplicas: z.number().optional().describe("Number of replicas"),
+    sleepApplication: z.boolean().optional().describe("Enable sleep when idle"),
+    region: z.string().optional().describe("Deployment region"),
+    cronSchedule: z.string().optional().describe("Cron schedule for cron jobs"),
+  },
+  async (params) => {
+    const { serviceId, environmentId, ...rest } = params;
+    const input: Record<string, unknown> = { serviceId, environmentId };
+    for (const [k, v] of Object.entries(rest)) {
+      if (v !== undefined) input[k] = v;
+    }
+    const data = await gql(`
+      mutation($input: ServiceInstanceUpdateInput!) {
+        serviceInstanceUpdate(input: $input)
+      }
+    `, { input });
+    return { content: [{ type: "text", text: "Service instance updated successfully." }] };
+  }
+);
+
+// ── Tool: railway_create_environment ────────────────────────────────────────
+
+server.tool(
+  "railway_create_environment",
+  "Create a new environment in a project (e.g., staging, production)",
+  {
+    projectId: z.string().describe("Project ID"),
+    name: z.string().describe("Environment name"),
+  },
+  async ({ projectId, name }) => {
+    const data = await gql(`
+      mutation($input: EnvironmentCreateInput!) {
+        environmentCreate(input: $input) { id name }
+      }
+    `, { input: { projectId, name } });
+    return { content: [{ type: "text", text: fmt(data.environmentCreate) }] };
+  }
+);
+
+// ── Tool: railway_delete_environment ────────────────────────────────────────
+
+server.tool(
+  "railway_delete_environment",
+  "Delete an environment from a project",
+  { environmentId: z.string().describe("Environment ID to delete") },
+  async ({ environmentId }) => {
+    await gql(`mutation($id: String!) { environmentDelete(id: $id) }`, { id: environmentId });
+    return { content: [{ type: "text", text: "Environment deleted." }] };
+  }
+);
+
+// ── Tool: railway_create_custom_domain ──────────────────────────────────────
+
+server.tool(
+  "railway_create_custom_domain",
+  "Add a custom domain to a service",
+  {
+    projectId: z.string().describe("Project ID"),
+    serviceId: z.string().describe("Service ID"),
+    environmentId: z.string().describe("Environment ID"),
+    domain: z.string().describe("Custom domain (e.g., app.example.com)"),
+    targetPort: z.number().optional().describe("Target port (optional)"),
+  },
+  async ({ projectId, serviceId, environmentId, domain, targetPort }) => {
+    const input: Record<string, unknown> = { projectId, serviceId, environmentId, domain };
+    if (targetPort !== undefined) input.targetPort = targetPort;
+    const data = await gql(`
+      mutation($input: CustomDomainCreateInput!) {
+        customDomainCreate(input: $input) { id domain }
+      }
+    `, { input });
+    return { content: [{ type: "text", text: fmt(data.customDomainCreate) }] };
+  }
+);
+
+// ── Tool: railway_create_service_domain ─────────────────────────────────────
+
+server.tool(
+  "railway_create_service_domain",
+  "Generate a *.railway.app domain for a service",
+  {
+    serviceId: z.string().describe("Service ID"),
+    environmentId: z.string().describe("Environment ID"),
+    targetPort: z.number().optional().describe("Target port (optional)"),
+  },
+  async ({ serviceId, environmentId, targetPort }) => {
+    const input: Record<string, unknown> = { serviceId, environmentId };
+    if (targetPort !== undefined) input.targetPort = targetPort;
+    const data = await gql(`
+      mutation($input: ServiceDomainCreateInput!) {
+        serviceDomainCreate(input: $input) { id domain }
+      }
+    `, { input });
+    return { content: [{ type: "text", text: fmt(data.serviceDomainCreate) }] };
+  }
+);
+
+// ── Tool: railway_list_domains ──────────────────────────────────────────────
+
+server.tool(
+  "railway_list_domains",
+  "List all domains (custom and service) for a service in an environment",
+  {
+    projectId: z.string().describe("Project ID"),
+    serviceId: z.string().describe("Service ID"),
+    environmentId: z.string().describe("Environment ID"),
+  },
+  async ({ projectId, serviceId, environmentId }) => {
+    const data = await gql(`
+      query($projectId: String!, $serviceId: String!, $environmentId: String!) {
+        domains(projectId: $projectId, serviceId: $serviceId, environmentId: $environmentId) {
+          serviceDomains { id domain }
+          customDomains { id domain }
+        }
+      }
+    `, { projectId, serviceId, environmentId });
+    return { content: [{ type: "text", text: fmt(data.domains) }] };
+  }
+);
+
+// ── Tool: railway_create_volume ─────────────────────────────────────────────
+
+server.tool(
+  "railway_create_volume",
+  "Create a persistent volume for a service",
+  {
+    projectId: z.string().describe("Project ID"),
+    serviceId: z.string().optional().describe("Service ID"),
+    environmentId: z.string().optional().describe("Environment ID"),
+    mountPath: z.string().describe("Mount path in the container (e.g., /data)"),
+  },
+  async ({ projectId, serviceId, environmentId, mountPath }) => {
+    const input: Record<string, unknown> = { projectId, mountPath };
+    if (serviceId) input.serviceId = serviceId;
+    if (environmentId) input.environmentId = environmentId;
+    const data = await gql(`
+      mutation($input: VolumeCreateInput!) {
+        volumeCreate(input: $input) { id name }
+      }
+    `, { input });
+    return { content: [{ type: "text", text: fmt(data.volumeCreate) }] };
+  }
+);
+
+// ── Tool: railway_delete_volume ─────────────────────────────────────────────
+
+server.tool(
+  "railway_delete_volume",
+  "Delete a volume",
+  { volumeId: z.string().describe("Volume ID to delete") },
+  async ({ volumeId }) => {
+    await gql(`mutation($id: String!) { volumeDelete(volumeId: $id) }`, { id: volumeId });
+    return { content: [{ type: "text", text: "Volume deleted." }] };
+  }
+);
+
+// ── Tool: railway_create_tcp_proxy ──────────────────────────────────────────
+
+server.tool(
+  "railway_create_tcp_proxy",
+  "Create a TCP proxy for a service (useful for databases)",
+  {
+    serviceId: z.string().describe("Service ID"),
+    environmentId: z.string().describe("Environment ID"),
+    applicationPort: z.number().describe("Internal application port"),
+  },
+  async ({ serviceId, environmentId, applicationPort }) => {
+    const data = await gql(`
+      mutation($input: TCPProxyCreateInput!) {
+        tcpProxyCreate(input: $input) { id domain proxyPort }
+      }
+    `, { input: { serviceId, environmentId, applicationPort } });
+    return { content: [{ type: "text", text: fmt(data.tcpProxyCreate) }] };
+  }
+);
+
+// ── Tool: railway_graphql (escape hatch) ────────────────────────────────────
+
+server.tool(
+  "railway_graphql",
+  "Execute an arbitrary GraphQL query/mutation against the Railway API. Use for any operation not covered by other tools.",
+  {
+    query: z.string().describe("GraphQL query or mutation string"),
+    variables: z.record(z.unknown()).optional().describe("GraphQL variables object"),
+  },
+  async ({ query, variables }) => {
+    const data = await gql(query, variables || {});
+    return { content: [{ type: "text", text: fmt(data) }] };
+  }
+);
+
+// ── Express + Streamable HTTP Transport ─────────────────────────────────────
+
+const app = express();
+app.use(express.json());
+
+app.post("/mcp", async (req, res) => {
+  try {
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+    });
+    res.on("close", () => transport.close());
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err: any) {
+    console.error("MCP error:", err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+});
+
+// Health check
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", server: "railway-mcp-server", version: "1.0.0" });
+});
+
+const PORT = parseInt(process.env.PORT || "3000", 10);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Railway MCP server listening on port ${PORT}`);
+});
