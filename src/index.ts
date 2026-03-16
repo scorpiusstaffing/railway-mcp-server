@@ -38,12 +38,20 @@ function fmt(data: unknown): string {
   return JSON.stringify(data, null, 2);
 }
 
-// ── MCP Server ──────────────────────────────────────────────────────────────
+// ── MCP Server Factory ──────────────────────────────────────────────────
 
-const server = new McpServer({
-  name: "railway-mcp-server",
-  version: "1.0.0",
-});
+function createServer(): McpServer {
+  const server = new McpServer({
+    name: "railway-mcp-server",
+    version: "1.0.0",
+  });
+  registerTools(server);
+  return server;
+}
+
+// ── Tool Registration ────────────────────────────────────────────────────
+
+function registerTools(server: McpServer) {
 
 // ── Tool: railway_me ────────────────────────────────────────────────────────
 
@@ -749,6 +757,8 @@ server.tool(
   }
 );
 
+}
+
 // ── Express + Streamable HTTP Transport ─────────────────────────────────────
 
 const app = express();
@@ -756,12 +766,16 @@ app.use(express.json());
 
 app.post("/mcp", async (req, res) => {
   try {
+    const perRequestServer = createServer();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
     });
-    res.on("close", () => transport.close());
-    await server.connect(transport);
+    res.on("close", () => {
+      transport.close();
+      perRequestServer.close();
+    });
+    await perRequestServer.connect(transport);
     await transport.handleRequest(req, res, req.body);
   } catch (err: any) {
     console.error("MCP error:", err);
